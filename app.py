@@ -1,196 +1,260 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
+import yfinance as yf
 from datetime import datetime, timezone
+from streamlit_autorefresh import st_autorefresh
 
-st.set_page_config(page_title="AI Trading Signal Scanner", page_icon="📡", layout="wide")
+st.set_page_config(page_title="AI Trading Scanner", page_icon="📈", layout="wide")
 
-st.title("📡 AI Trading Signal Scanner")
-st.caption("Gratis prototype • XAUUSD & XAGUSD • signalen-only • geen automatische orders")
+st.title("📈 AI Trading Scanner")
+st.caption("Automatische signalenscanner voor goud en zilver — geen automatische orders.")
 
-st.warning(
-    "Educatieve prototypeversie. Dit is geen financieel advies en signalen zijn geen voorspellingen. "
-    "Controleer koersen bij je broker. Yahoo Finance-data kan vertraagd, onvolledig of tijdelijk niet beschikbaar zijn."
-)
+# Automatic refresh. Streamlit Cloud may sleep while the app is inactive.
+refresh_seconds = st.sidebar.selectbox("Automatisch verversen", [30, 60, 120, 300], index=1)
+st_autorefresh(interval=refresh_seconds * 1000, key="market_refresh")
 
-SYMBOLS = {
-    "XAUUSD (goud)": {"primary": "XAUUSD=X", "fallback": "GC=F", "label": "Gold"},
-    "XAGUSD (zilver)": {"primary": "XAGUSD=X", "fallback": "SI=F", "label": "Silver"},
+symbol_map = {
+    "Goud (XAUUSD)": [("XAUUSD=X", "Yahoo spot"), ("GC=F", "Gold futures-proxy")],
+    "Zilver (XAGUSD)": [("XAGUSD=X", "Yahoo spot"), ("SI=F", "Silver futures-proxy")],
+}
+asset = st.sidebar.selectbox("Markt", list(symbol_map.keys()))
+timeframe = st.sidebar.selectbox("Analyse-timeframe", ["15m", "1h", "1d"], index=0)
+show_debug = st.sidebar.checkbox("Toon technische details", value=False)
+
+TIMEFRAME_SETTINGS = {
+    "15m": {"period": "7d", "interval": "15m"},
+    "1h": {"period": "60d", "interval": "1h"},
+    "1d": {"period": "2y", "interval": "1d"},
 }
 
-@st.cache_data(ttl=300, show_spinner=False)
-def load_data(symbol, period, interval):
-    df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
-    if df is None or df.empty:
+@st.cache_data(ttl=45, show_spinner=False)
+def get_market_data(ticker, period, interval):
+    raw = yf.download(
+        ticker, period=period, interval=interval,
+        auto_adjust=True, progress=False, threads=False
+    )
+    if raw is None or raw.empty:
         return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    df = df.rename(columns=str.title)
-    needed = ["Open", "High", "Low", "Close"]
-    if not all(c in df.columns for c in needed):
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+    raw = raw.rename(columns=lambda x: str(x).title())
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    if not all(c in raw.columns for c in required):
         return pd.DataFrame()
-    return df.dropna(subset=needed).copy()
+    raw = raw[required].dropna()
+    return raw
 
-def rsi(series, length=14):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/length, min_periods=length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/length, min_periods=length, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
-
-def enrich(df):
+def add_indicators(df):
     d = df.copy()
-    close = d["Close"]
-    d["EMA9"] = close.ewm(span=9, adjust=False).mean()
-    d["EMA21"] = close.ewm(span=21, adjust=False).mean()
-    d["RSI14"] = rsi(close)
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    d["MACD"] = ema12 - ema26
-    d["MACD_signal"] = d["MACD"].ewm(span=9, adjust=False).mean()
-    prev_close = close.shift(1)
+    d["EMA9"] = d["Close"].ewm(span=9, adjust=False).mean()
+    d["EMA21"] = d["Close"].ewm(span=21, adjust=False).mean()
+    delta = d["Close"].diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    d["RSI"] = 100 - (100 / (1 + rs))
+    fast = d["Close"].ewm(span=12, adjust=False).mean()
+    slow = d["Close"].ewm(span=26, adjust=False).mean()
+    d["MACD"] = fast - slow
+    d["MACD_Signal"] = d["MACD"].ewm(span=9, adjust=False).mean()
+    prev_close = d["Close"].shift(1)
     tr = pd.concat([
         d["High"] - d["Low"],
         (d["High"] - prev_close).abs(),
         (d["Low"] - prev_close).abs()
     ], axis=1).max(axis=1)
-    d["ATR14"] = tr.ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+    d["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean()
     return d.dropna()
 
-def analyse(d):
-    if len(d) < 30:
-        return {"signal": "INSUFFICIENT DATA", "score": 0, "reasons": ["Niet genoeg candles voor betrouwbare indicatorberekening."]}
-    last = d.iloc[-1]
-    checks = {
-        "EMA-trend": last["EMA9"] > last["EMA21"],
-        "Prijs boven EMA21": last["Close"] > last["EMA21"],
-        "RSI-momentum": 50 < last["RSI14"] < 70,
-        "MACD-momentum": last["MACD"] > last["MACD_signal"],
-    }
-    sell_checks = {
-        "EMA-trend": last["EMA9"] < last["EMA21"],
-        "Prijs onder EMA21": last["Close"] < last["EMA21"],
-        "RSI-momentum": 30 < last["RSI14"] < 50,
-        "MACD-momentum": last["MACD"] < last["MACD_signal"],
-    }
-    buy_score = sum(bool(v) for v in checks.values())
-    sell_score = sum(bool(v) for v in sell_checks.values())
-    if buy_score == 4:
-        signal, score, reasons = "BUY SETUP", buy_score, [f"✓ {k}" for k in checks]
+def get_direction(df):
+    if len(df) < 30:
+        return "ONBEKEND"
+    last = df.iloc[-1]
+    if last["EMA9"] > last["EMA21"] and last["Close"] > last["EMA21"]:
+        return "STIJGEND"
+    if last["EMA9"] < last["EMA21"] and last["Close"] < last["EMA21"]:
+        return "DALEND"
+    return "ZIJWAARTS"
+
+def analyze(df, higher_df):
+    last = df.iloc[-1]
+    previous = df.iloc[-2]
+    htf = get_direction(higher_df)
+    score_buy = 0
+    score_sell = 0
+    reasons_buy, reasons_sell = [], []
+
+    if last["EMA9"] > last["EMA21"]:
+        score_buy += 2; reasons_buy.append("EMA 9 boven EMA 21")
+    elif last["EMA9"] < last["EMA21"]:
+        score_sell += 2; reasons_sell.append("EMA 9 onder EMA 21")
+
+    if last["RSI"] >= 52 and last["RSI"] < 70:
+        score_buy += 1; reasons_buy.append("RSI ondersteunt opwaarts momentum")
+    elif last["RSI"] <= 48 and last["RSI"] > 30:
+        score_sell += 1; reasons_sell.append("RSI ondersteunt neerwaarts momentum")
+
+    if last["MACD"] > last["MACD_Signal"]:
+        score_buy += 1; reasons_buy.append("MACD boven signaallijn")
+    elif last["MACD"] < last["MACD_Signal"]:
+        score_sell += 1; reasons_sell.append("MACD onder signaallijn")
+
+    if last["Close"] > last["EMA21"]:
+        score_buy += 1; reasons_buy.append("Koers boven EMA 21")
+    elif last["Close"] < last["EMA21"]:
+        score_sell += 1; reasons_sell.append("Koers onder EMA 21")
+
+    # Higher timeframe is a filter, not a prediction.
+    if htf == "STIJGEND":
+        score_buy += 1; reasons_buy.append("Hoger timeframe stijgend")
+    elif htf == "DALEND":
+        score_sell += 1; reasons_sell.append("Hoger timeframe dalend")
+
+    # Avoid chasing extreme RSI.
+    if last["RSI"] >= 70:
+        score_buy -= 1
+    if last["RSI"] <= 30:
+        score_sell -= 1
+
+    if score_buy >= 4 and score_buy >= score_sell + 2:
+        signal = "BUY SETUP"
+        reasons = reasons_buy
         direction = 1
-    elif sell_score == 4:
-        signal, score, reasons = "SELL SETUP", sell_score, [f"✓ {k}" for k in sell_checks]
+    elif score_sell >= 4 and score_sell >= score_buy + 2:
+        signal = "SELL SETUP"
+        reasons = reasons_sell
         direction = -1
     else:
-        signal, score, reasons = "NO TRADE", max(buy_score, sell_score), []
+        signal = "AFWACHTEN"
+        reasons = ["Geen duidelijke combinatie van bevestigingen."]
         direction = 0
-        for k, v in checks.items():
-            reasons.append(("✓ " if v else "— ") + "Bullish: " + k)
-        for k, v in sell_checks.items():
-            reasons.append(("✓ " if v else "— ") + "Bearish: " + k)
-    entry = float(last["Close"])
-    atr = float(last["ATR14"])
-    if direction:
-        stop = entry - direction * 1.5 * atr
-        target = entry + direction * 3.0 * atr
-    else:
-        stop = target = None
+
+    # A possible exit warning is a weakening / opposite momentum hint, not an instruction.
+    exit_warning = False
+    if direction == 1 and (last["EMA9"] < previous["EMA9"] or last["MACD"] < last["MACD_Signal"]):
+        exit_warning = True
+    if direction == -1 and (last["EMA9"] > previous["EMA9"] or last["MACD"] > last["MACD_Signal"]):
+        exit_warning = True
+
+    price = float(last["Close"])
+    atr = float(last["ATR"])
+    sl = price - direction * 1.5 * atr if direction else np.nan
+    tp = price + direction * 2.0 * atr if direction else np.nan
+    strength = max(score_buy, score_sell)
+    confidence = min(95, max(0, int(strength / 6 * 100)))
+
     return {
-        "signal": signal, "score": score, "reasons": reasons,
-        "entry": entry, "stop": stop, "target": target,
-        "rsi": float(last["RSI14"]), "ema9": float(last["EMA9"]),
-        "ema21": float(last["EMA21"]), "macd": float(last["MACD"]),
-        "atr": atr, "timestamp": d.index[-1]
+        "signal": signal, "price": price, "sl": sl, "tp": tp,
+        "rsi": float(last["RSI"]), "atr": atr, "htf": htf,
+        "score_buy": score_buy, "score_sell": score_sell,
+        "confidence": confidence, "reasons": reasons,
+        "exit_warning": exit_warning, "timestamp": df.index[-1]
     }
 
-with st.sidebar:
-    st.header("Instellingen")
-    market = st.selectbox("Markt", list(SYMBOLS.keys()))
-    timeframe = st.selectbox("Timeframe", ["15m", "1h", "1d"], index=1)
-    st.caption("15m: korte termijn • 1h: intraday • 1d: swingcontext")
-    refresh = st.button("🔄 Vernieuw data", use_container_width=True)
-    if refresh:
-        st.cache_data.clear()
-    st.divider()
-    st.caption("Data: Yahoo Finance via yfinance. Futures-symbolen worden als fallback gebruikt.")
+def fmt_price(value):
+    return "—" if pd.isna(value) else f"{value:,.3f}"
 
-cfg = SYMBOLS[market]
-period_map = {"15m": ("60d", "15m"), "1h": ("730d", "1h"), "1d": ("5y", "1d")}
-period, interval = period_map[timeframe]
+settings = TIMEFRAME_SETTINGS[timeframe]
+data = pd.DataFrame()
+used_ticker, source_note = None, None
+with st.spinner("Marktgegevens ophalen..."):
+    for ticker, note in symbol_map[asset]:
+        data = get_market_data(ticker, settings["period"], settings["interval"])
+        if not data.empty and len(data) >= 35:
+            used_ticker, source_note = ticker, note
+            break
 
-with st.spinner(f"Koersdata ophalen voor {market}..."):
-    raw = load_data(cfg["primary"], period, interval)
-    used_symbol = cfg["primary"]
-    if raw.empty:
-        raw = load_data(cfg["fallback"], period, interval)
-        used_symbol = cfg["fallback"]
-
-if raw.empty:
-    st.error("Geen koersdata ontvangen. Probeer later opnieuw of controleer je internetverbinding.")
-    st.info(f"Geprobeerd: {cfg['primary']} en {cfg['fallback']}.")
+if data.empty or len(data) < 35:
+    st.error("Er zijn onvoldoende koersgegevens beschikbaar. Probeer later opnieuw of kies een ander timeframe.")
+    st.info("Yahoo Finance kan tijdelijk geen data leveren. De scanner gebruikt geen brokerkoersen.")
     st.stop()
 
-data = enrich(raw)
-if data.empty:
-    st.error("Er is onvoldoende historische data om indicatoren te berekenen.")
+# A separate higher timeframe provides a broad trend filter.
+higher_interval = "1h" if timeframe == "15m" else "1d"
+higher_period = "60d" if higher_interval == "1h" else "2y"
+higher = get_market_data(used_ticker, higher_period, higher_interval)
+if higher.empty or len(higher) < 30:
+    higher = data
+data_i = add_indicators(data)
+higher_i = add_indicators(higher)
+if len(data_i) < 2 or len(higher_i) < 2:
+    st.error("Niet genoeg gegevens om indicatoren te berekenen.")
     st.stop()
 
-result = analyse(data)
+result = analyze(data_i, higher_i)
+now = datetime.now(timezone.utc)
+st.caption(f"Laatste controle: {now.astimezone().strftime('%d-%m-%Y %H:%M:%S')} · Databron: {source_note} ({used_ticker}) · Laatste candle: {result['timestamp']}")
+
+# Track changes in the signal between refreshes.
+if "last_signal_by_asset" not in st.session_state:
+    st.session_state.last_signal_by_asset = {}
+if "signal_events" not in st.session_state:
+    st.session_state.signal_events = []
+
+previous_signal = st.session_state.last_signal_by_asset.get(asset)
+if previous_signal != result["signal"]:
+    if previous_signal is not None:
+        st.session_state.signal_events.insert(0, {
+            "time": now.astimezone().strftime("%H:%M:%S"),
+            "asset": asset,
+            "change": f"{previous_signal} → {result['signal']}"
+        })
+    st.session_state.last_signal_by_asset[asset] = result["signal"]
+
+signal_colors = {
+    "BUY SETUP": "🟢",
+    "SELL SETUP": "🔴",
+    "AFWACHTEN": "🟡"
+}
+st.subheader(f"{signal_colors[result['signal']]} {result['signal']}")
+if result["exit_warning"]:
+    st.warning("EXIT-WAARSCHUWING: momentum verzwakt of beweegt tegen het huidige setup in. Controleer je positie en eigen handelsplan. Dit is geen automatische sluitopdracht.")
+elif result["signal"] == "AFWACHTEN":
+    st.info("Geen sterke setup. Niet forceren; wacht op meer bevestiging.")
+
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Laatste koers", f"{result.get('entry', float(data['Close'].iloc[-1])):,.3f}")
-c2.metric("RSI (14)", f"{result['rsi']:.1f}")
-c3.metric("EMA 9 / 21", "Bullish" if result["ema9"] > result["ema21"] else "Bearish")
-c4.metric("Setup-score", f"{result['score']}/4")
+c1.metric("Indicatieve koers", fmt_price(result["price"]))
+c2.metric("Signaalsterkte (heuristisch)", f"{result['confidence']}/100")
+c3.metric("RSI 14", f"{result['rsi']:.1f}")
+c4.metric("Hoger timeframe", result["htf"])
 
-st.subheader(f"{market} — {timeframe}")
-if result["signal"] == "BUY SETUP":
-    st.success("🟢 BUY SETUP — alle vier technische voorwaarden zijn bevestigd.")
-elif result["signal"] == "SELL SETUP":
-    st.error("🔴 SELL SETUP — alle vier technische voorwaarden zijn bevestigd.")
+c5, c6 = st.columns(2)
+c5.metric("Indicatieve stop-loss", fmt_price(result["sl"]))
+c6.metric("Indicatieve take-profit", fmt_price(result["tp"]))
+
+st.subheader("Waarom dit signaal?")
+for reason in result["reasons"]:
+    st.write("• " + reason)
+
+st.subheader("Marktontwikkeling")
+st.line_chart(data_i[["Close", "EMA9", "EMA21"]].tail(100), use_container_width=True)
+
+if result["exit_warning"]:
+    st.warning("Let op: dit is een vroege waarschuwing op basis van indicatoren. Het is geen bewijs dat de markt daadwerkelijk omkeert.")
+
+st.subheader("Automatische updates")
+st.write(f"De app controleert elke **{refresh_seconds} seconden** opnieuw. De tijdlijn registreert wanneer de hoofdstatus verandert.")
+if st.session_state.signal_events:
+    st.dataframe(pd.DataFrame(st.session_state.signal_events[:20]), use_container_width=True, hide_index=True)
 else:
-    st.info("⚪ NO TRADE — de voorwaarden zijn niet allemaal tegelijk bevestigd.")
+    st.caption("Nog geen signaalwisselingen geregistreerd tijdens deze sessie.")
 
-left, right = st.columns([1, 1])
-with left:
-    st.markdown("#### Analyse")
-    for reason in result["reasons"]:
-        st.write(reason)
-    st.caption(f"Laatste candle: {result['timestamp']} • Dataticker: {used_symbol}")
-with right:
-    st.markdown("#### Voorwaardelijke trade-niveaus")
-    if result["signal"] in ("BUY SETUP", "SELL SETUP"):
-        st.metric("Referentie-entry", f"{result['entry']:,.3f}")
-        st.metric("Indicatieve stop-loss (1,5 × ATR)", f"{result['stop']:,.3f}")
-        st.metric("Indicatieve take-profit (3 × ATR)", f"{result['target']:,.3f}")
-        st.caption("Indicatieve niveaus op basis van de laatst gesloten/beschikbare candle; spreads, slippage en brokerprijzen kunnen afwijken.")
-    else:
-        st.write("Geen entry, stop-loss of take-profit zolang er geen volledige setup is.")
+if show_debug:
+    st.subheader("Technische details")
+    st.write({
+        "Koersbron": used_ticker,
+        "BUY-score": result["score_buy"],
+        "SELL-score": result["score_sell"],
+        "ATR": result["atr"],
+        "Laatste candle": str(result["timestamp"])
+    })
+    st.dataframe(data_i.tail(10), use_container_width=True)
 
-st.markdown("#### Koersgrafiek en gemiddelden")
-chart = data[["Close", "EMA9", "EMA21"]].tail(180).rename(
-    columns={"Close": "Prijs", "EMA9": "EMA 9", "EMA21": "EMA 21"}
-)
-st.line_chart(chart, use_container_width=True)
-
-with st.expander("Indicatorwaarden en recente candles"):
-    st.dataframe(data[["Open", "High", "Low", "Close", "EMA9", "EMA21", "RSI14", "MACD", "MACD_signal", "ATR14"]].tail(20), use_container_width=True)
-
-with st.expander("Hoe werkt deze eerste versie?"):
-    st.markdown("""
-    **BUY SETUP** vereist tegelijkertijd:
-    - EMA 9 boven EMA 21
-    - Slotkoers boven EMA 21
-    - RSI tussen 50 en 70
-    - MACD boven de signaallijn
-
-    **SELL SETUP** gebruikt de omgekeerde voorwaarden (RSI tussen 30 en 50).
-    Anders is het resultaat **NO TRADE**.
-
-    De score is het aantal overeenkomende voorwaarden, geen winstkans of betrouwbaarheidspercentage.
-    De app gebruikt nog geen nieuwsanalyse, orderboekdata, sentimentdata of machine learning.
-    """)
-
-st.caption(f"Prototype • Laatst vernieuwd: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} • Geen orders worden geplaatst.")
+with st.expander("Belangrijke beperkingen en veilig gebruik"):
+    st.write(
+        "Deze scanner is een regelgebaseerd prototype, geen zelflerend AI-model en geen bewezen winstgevende strategie. "
+        "Yahoo Finance-data kan vertraagd, onvolledig of anders dan de koers van jouw MT5-broker zijn. "
+        "De SL/TP zijn indicatieve ATR-niveaus en houden geen rekening met spread, slippage, swaps of jouw contractgrootte. "
+        "Een signaalsterkte is geen statistische kans op winst. Test eerst op demo en controleer altijd de brokerkoers."
+    )
