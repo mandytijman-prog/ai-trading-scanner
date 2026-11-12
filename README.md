@@ -1,30 +1,35 @@
-# AI Trading Scanner v2
+# Trading Scanner v3 – voorstel voor Mandy
 
-Streamlit-signaaldashboard voor XAUUSD (goud) en XAGUSD (zilver).
+Verbeterde **educatieve** versie op basis van de publiek gedeelde v2-scanner.
+De bestaande GitHub-repository is **niet gewijzigd**. Dit pakket is geen bewezen winstgevende bot en **plaatst geen orders**.
 
-## Bestanden
-- `app.py` — Streamlit-app
-- `requirements.txt` — Python-dependencies
+## Concrete verbeteringen
+- Alleen volledig afgesloten candles, gecontroleerd met UTC-tijdstempels.
+- Filter op verouderde marktdata en expliciete waarschuwing bij futures-proxy.
+- Hoger timeframe is nu een harde voorwaarde; geen stilzwijgende fallback naar dezelfde candles.
+- RSI randgevallen gecorrigeerd, indicators met warm-up periode.
+- Instelbare ATR-stop en R:R; standaard 1:2 (niet automatisch een betere strategie).
+- Regelscore in punten in plaats van misleidend winstkans-percentage.
+- Signaalwisselingen per markt/timeframe/instellingen met CSV-export binnen sessie.
+- Faal-veilig: bij ontbrekende of ongeldige data geen signaal.
+- Kleine automatische eenheidstests.
 
-## Lokaal starten
+## Starten
 ```bash
 pip install -r requirements.txt
+python -m unittest -v test_scanner_core.py
 streamlit run app.py
 ```
 
-## Publiceren
-Zet `app.py`, `requirements.txt` en `README.md` in de hoofdmap van je GitHub-repository.
-Deploy via Streamlit Community Cloud met:
-- Branch: `main`
-- Main file path: `app.py`
+Voor Streamlit Cloud: upload `app.py`, `scanner_core.py`, `requirements.txt` en `README.md` naar een **aparte testbranch of repository**; main file `app.py`. Niet direct de oude versie overschrijven.
 
-## Functies
-- Automatische verversing (30, 60, 120 of 300 seconden)
-- BUY SETUP / SELL SETUP / AFWACHTEN
-- Exit-waarschuwing bij verzwakkend momentum
-- EMA 9/21, RSI, MACD, ATR en hoger-timeframe-filter
-- Indicatieve ATR-gebaseerde SL/TP
-- Signaalwisselingen-tijdlijn binnen de actieve sessie
+## Bewuste beperkingen
+- Dagtimeframe uitgeschakeld omdat er geen apart hoger timeframe in de oorspronkelijke gegevenskeuze beschikbaar is.
+- Yahoo Finance is geen uitvoeringsbron voor een funded account.
+- Geen echte achtergrondscanner: Streamlit kan inactief worden.
+- Historie in sessie is niet duurzaam; CSV-download is handmatig.
+- Geen empirische backtest of out-of-sample validatie.
+- Geen MT5 orders, accountbeheer, lot sizing, spread/slippage of prop-firm compliance.
+- De trendfilter kan voorkomen dat sommige kansen gesignaleerd worden; impact onbekend.
 
-## Belangrijk
-Dit is een educatief, regelgebaseerd prototype. Het is geen financieel advies, geen gegarandeerd winstgevend systeem en plaatst geen orders. Yahoo Finance-data kan vertraagd zijn en kan afwijken van brokerkoersen. De getoonde signaalsterkte is geen statistische win kans. Test eerst op een demo-account.
+**Volgende stap:** onafhankelijke historische backtests met brokerdata, kosten en out-of-sample tests; daarna langdurig forward-testen op demo, voordat uitvoering zelfs overwogen wordt.
